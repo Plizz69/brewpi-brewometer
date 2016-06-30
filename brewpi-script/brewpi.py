@@ -38,10 +38,14 @@ import urllib
 from distutils.version import LooseVersion
 from serial import SerialException
 
+# brewometer code
 import Brewometer
 import thread
 
 # load non standard packages, exit when they are not installed
+
+
+
 try:
     import serial
     if LooseVersion(serial.VERSION) < LooseVersion("3.0"):
@@ -84,16 +88,20 @@ from backgroundserial import BackGroundSerial
 # Settings will be read from controller, initialize with same defaults as controller
 # This is mainly to show what's expected. Will all be overwritten on the first update from the controller
 
-compatibleHwVersion = "0.4.0"
+compatibleHwVersion = "0.2.4"
 
 # Control Settings
-cs = dict(mode='b', beerSet=20.0, fridgeSet=20.0)
+cs = dict(mode='b', beerSet=20.0, fridgeSet=20.0, heatEstimator=0.2, coolEstimator=5)
 
 # Control Constants
-cc = dict()
+cc = dict(tempFormat="C", tempSetMin=1.0, tempSetMax=30.0, pidMax=10.0, Kp=20.000, Ki=0.600, Kd=-3.000, iMaxErr=0.500,
+          idleRangeH=1.000, idleRangeL=-1.000, heatTargetH=0.301, heatTargetL=-0.199, coolTargetH=0.199,
+          coolTargetL=-0.301, maxHeatTimeForEst="600", maxCoolTimeForEst="1200", fridgeFastFilt="1", fridgeSlowFilt="4",
+          fridgeSlopeFilt="3", beerFastFilt="3", beerSlowFilt="5", beerSlopeFilt="4", lah=0, hs=0)
 
-# Control variables (json string, sent directly to browser without decoding)
-cv = "{}"
+# Control variables
+cv = dict(beerDiff=0.000, diffIntegral=0.000, beerSlope=0.000, p=0.000, i=0.000, d=0.000, estPeak=0.000,
+          negPeakEst=0.000, posPeakEst=0.000, negPeak=0.000, posPeak=0.000)
 
 # listState = "", "d", "h", "dh" to reflect whether the list is up to date for installed (d) and available (h)
 deviceList = dict(listState="", installed=[], available=[])
@@ -287,7 +295,6 @@ def startBeer(beerName):
 
     changeWwwSetting('beerName', beerName)
 
-
 def startNewBrew(newName):
     global config
     if len(newName) > 1:     # shorter names are probably invalid
@@ -363,11 +370,6 @@ else:
                    "does not match log version number received from controller." +
                    "controller version = " + str(hwVersion.log) +
                    ", local copy version = " + str(expandLogMessage.getVersion()))
-    if hwVersion.family == 'Arduino':
-        exit("\n ERROR: the newest version of BrewPi is not compatible with Arduino. \n" +
-            "You can use our legacy branch with your Arduino, in which we only include the backwards compatible changes. \n" +
-            "To change to the legacy branch, run: sudo ~/brewpi-tools/updater.py --ask , and choose the legacy branch.")
-
 
 bg_ser = None
 
@@ -380,7 +382,6 @@ if ser is not None:
     # request settings from controller, processed later when reply is received
     bg_ser.write('s')  # request control settings cs
     bg_ser.write('c')  # request control constants cc
-    bg_ser.write('v')  # request control variables cv
     # answer from controller is received asynchronously later.
 
 # create a listening socket to communicate with PHP
@@ -426,7 +427,6 @@ outputTemperature = True
 brewometer = Brewometer.BrewometerManager(False, 300, 10000)
 brewometer.start()
 
-##Modify prevTempJson to add brewometer elements.
 prevTempJson = {
     "BeerTemp": 0,
     "FridgeTemp": 0,
@@ -493,7 +493,7 @@ while run:
             cs['dataLogging'] = config['dataLogging']
             conn.send(json.dumps(cs))
         elif messageType == "getControlVariables":
-            conn.send(cv)
+            conn.send(json.dumps(cv))
         elif messageType == "refreshControlConstants":
             bg_ser.write("c")
             raise socket.timeout
@@ -515,16 +515,20 @@ while run:
             except ValueError:
                 logMessage("Cannot convert temperature '" + value + "' to float")
                 continue
-
-            cs['mode'] = 'b'
-            # round to 2 dec, python will otherwise produce 6.999999999
-            cs['beerSet'] = round(newTemp, 2)
-            bg_ser.write("j{mode:b, beerSet:" + json.dumps(cs['beerSet']) + "}")
-            logMessage("Notification: Beer temperature set to " +
-                       str(cs['beerSet']) +
-                       " degrees in web interface")
-            raise socket.timeout  # go to serial communication to update controller
-
+            if cc['tempSetMin'] <= newTemp <= cc['tempSetMax']:
+                cs['mode'] = 'b'
+                # round to 2 dec, python will otherwise produce 6.999999999
+                cs['beerSet'] = round(newTemp, 2)
+                bg_ser.write("j{mode:b, beerSet:" + json.dumps(cs['beerSet']) + "}")
+                logMessage("Notification: Beer temperature set to " +
+                           str(cs['beerSet']) +
+                           " degrees in web interface")
+                raise socket.timeout  # go to serial communication to update controller
+            else:
+                logMessage("Beer temperature setting " + str(newTemp) +
+                           " is outside of allowed range " +
+                           str(cc['tempSetMin']) + " - " + str(cc['tempSetMax']) +
+                           ". These limits can be changed in advanced settings.")
         elif messageType == "setFridge":  # new constant fridge temperature received
             try:
                 newTemp = float(value)
@@ -532,14 +536,19 @@ while run:
                 logMessage("Cannot convert temperature '" + value + "' to float")
                 continue
 
-            cs['mode'] = 'f'
-            cs['fridgeSet'] = round(newTemp, 2)
-            bg_ser.write("j{mode:f, fridgeSet:" + json.dumps(cs['fridgeSet']) + "}")
-            logMessage("Notification: Fridge temperature set to " +
-                       str(cs['fridgeSet']) +
-                       " degrees in web interface")
-            raise socket.timeout  # go to serial communication to update controller
-
+            if cc['tempSetMin'] <= newTemp <= cc['tempSetMax']:
+                cs['mode'] = 'f'
+                cs['fridgeSet'] = round(newTemp, 2)
+                bg_ser.write("j{mode:f, fridgeSet:" + json.dumps(cs['fridgeSet']) + "}")
+                logMessage("Notification: Fridge temperature set to " +
+                           str(cs['fridgeSet']) +
+                           " degrees in web interface")
+                raise socket.timeout  # go to serial communication to update controller
+            else:
+                logMessage("Fridge temperature setting " + str(newTemp) +
+                           " is outside of allowed range " +
+                           str(cc['tempSetMin']) + " - " + str(cc['tempSetMax']) +
+                           ". These limits can be changed in advanced settings.")
         elif messageType == "setOff":  # cs['mode'] set to OFF
             cs['mode'] = 'o'
             bg_ser.write("j{mode:o}")
@@ -684,13 +693,6 @@ while run:
                 continue
             bg_ser.write("U" + json.dumps(configStringJson))
             deviceList['listState'] = ""  # invalidate local copy
-        elif messageType == "writeDevice":
-            try:
-                configStringJson = json.loads(value)  # load as JSON to check syntax
-            except json.JSONDecodeError:
-                logMessage("Error: invalid JSON parameter string received: " + value)
-                continue
-            bg_ser.write("d" + json.dumps(configStringJson))
         elif messageType == "getVersion":
             if hwVersion:
                 response = hwVersion.__dict__
@@ -758,12 +760,6 @@ while run:
                         if config['dataLogging'] == 'paused' or config['dataLogging'] == 'stopped':
                             continue  # skip if logging is paused or stopped
 
-                        # process temperature line
-                        newData = json.loads(line[2:])
-                        # copy/rename keys
-                        for key in newData:
-                            prevTempJson[renameTempKey(key)] = newData[key]
-                        
                         ##Retrieve the current brewometer values
                         for colour in Brewometer.BREWOMETER_COLOURS:
                             brewometerValue = brewometer.getValue(colour)
@@ -774,8 +770,13 @@ while run:
                             else:
                                 prevTempJson[colour + 'Temp'] = None
                                 prevTempJson[colour + 'SG'] = None
-                    
-                    
+
+                        # process temperature line
+                        newData = json.loads(line[2:])
+                        # copy/rename keys
+                        for key in newData:
+                            prevTempJson[renameTempKey(key)] = newData[key]
+
                         newRow = prevTempJson
                         # add to JSON file
                         brewpiJson.addRow(localJsonFileName, newRow)
@@ -794,15 +795,17 @@ while run:
                                            json.dumps(newRow['FridgeAnn']) + ';' +
                                            json.dumps(newRow['State']) + ';' +
                                            json.dumps(newRow['RoomTemp']) + ';')
-                        
+                            
                             # Write out Brewometer Temp and SG Values
                             for colour in Brewometer.BREWOMETER_COLOURS:
                                 if prevTempJson.get(colour + 'Temp') is not None:
                                     lineToWrite += (json.dumps(prevTempJson[colour + 'Temp']) + ';' +
                                                 json.dumps(prevTempJson[colour + 'SG']) + ';')
-                        
-                            lineToWrite += '\n'
+
+
+                            lineToWrite += '\n'                
                             csvFile.write(lineToWrite)
+
                         except KeyError, e:
                             logMessage("KeyError in line from controller: %s" % str(e))
 
@@ -826,7 +829,7 @@ while run:
                     # do not print this to the log file. This is requested continuously.
                     elif line[0] == 'V':
                         # Control settings received
-                        cv = line[2:] # keep as string, do not decode
+                        cv = json.loads(line[2:])
                     elif line[0] == 'N':
                         pass  # version number received. Do nothing, just ignore
                     elif line[0] == 'h':
@@ -872,7 +875,7 @@ if bg_ser:
 
 #Stop monitoring the brewometer
 if brewometer:
-	brewometer.stop()
+    brewometer.stop()
 
 if ser:
     if ser.isOpen():
